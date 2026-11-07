@@ -8,12 +8,17 @@
 #include <cvc/point_cloud.hpp>
 #include <cvc/run_log.hpp>
 
+#ifdef CVC_WITH_GUI
+    #include <cvc/gui/view_editor.hpp>
+#endif
+
 #include <CLI/CLI.hpp>
 #include <glm/vec3.hpp>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <deque>
 #include <exception>
@@ -25,6 +30,7 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -110,6 +116,7 @@ namespace
         cvc::PixelFormat                   format            = cvc::PixelFormat::grayscale_alpha;
         cvc::Colormap                      colormap          = cvc::Colormap::viridis;
         bool                               resume            = false;
+        bool                               gui_config        = false;
     };
 
     using Json = nlohmann::ordered_json;
@@ -246,32 +253,74 @@ namespace
         return (directory / (name + ".png")).make_preferred();
     }
 
+    // Margin around the reference points a fitted view frames.
+    constexpr double fit_margin = 1.02;
+
+    // Lays out the mosaic of a shot; throws when its render or mosaic exceeds the PNG writer limit.
+    ViewPlan plan_view(const cvc::Shot& shot, std::size_t count, const Options& options)
+    {
+        const ViewPlan plan{shot, options.mosaic_resolution > 0
+                                      ? cvc::plan_mosaic(count, shot.camera, options.mosaic_resolution, options.format)
+                                      : cvc::plan_largest_mosaic(count, shot.camera, options.format)};
+        if (!cvc::png_writable(shot.camera.width, shot.camera.height, cvc::channel_count(options.format)))
+        {
+            throw std::runtime_error("render of view " + shot.view.name + " (" +
+                                     size_text(shot.camera.width, shot.camera.height) +
+                                     ") exceeds the 2 GiB PNG writer limit, lower --resolution");
+        }
+        const cvc::MosaicLayout& layout = plan.mosaic.layout;
+        if (!cvc::png_writable(plan.mosaic))
+        {
+            throw std::runtime_error("mosaic of view " + shot.view.name + " (" + size_text(layout.width(), layout.height()) +
+                                     ", tiles " + size_text(layout.tile_width, layout.tile_height) +
+                                     ") exceeds the 2 GiB PNG writer limit, lower --mosaic-resolution");
+        }
+        return plan;
+    }
+
+    // The mosaic is built from tiles read back from disk, which fails for tiles the PNG reader refuses.
+    std::string mosaic_warning(const ViewPlan& plan)
+    {
+        const cvc::MosaicLayout& layout = plan.mosaic.layout;
+        if (cvc::png_readable(layout.tile_width, layout.tile_height, plan.mosaic.tile_channels))
+        {
+            return {};
+        }
+        return "mosaic tiles of view " + plan.shot.view.name + " (" + size_text(layout.tile_width, layout.tile_height) +
+               ") exceed the 1 GiB PNG reader limit, so building its mosaic will fail after rendering; lower "
+               "--mosaic-resolution";
+    }
+
     std::vector<ViewPlan> plan_views(const cvc::PointCloud& reference, const cvc::Bounds& bounds, std::size_t count,
                                      const Options& options)
     {
         std::vector<ViewPlan> plans;
         for (const cvc::Shot& shot :
-             cvc::fit_views(reference, cvc::make_views(bounds), options.resolution, 1.02, options.fit_fraction))
+             cvc::fit_views(reference, cvc::make_views(bounds), options.resolution, fit_margin, options.fit_fraction))
         {
-            const ViewPlan plan{shot, options.mosaic_resolution > 0
-                                          ? cvc::plan_mosaic(count, shot.camera, options.mosaic_resolution, options.format)
-                                          : cvc::plan_largest_mosaic(count, shot.camera, options.format)};
-            if (!cvc::png_writable(shot.camera.width, shot.camera.height, cvc::channel_count(options.format)))
-            {
-                throw std::runtime_error("render of view " + shot.view.name + " (" +
-                                         size_text(shot.camera.width, shot.camera.height) +
-                                         ") exceeds the 2 GiB PNG writer limit, lower --resolution");
-            }
-            const cvc::MosaicLayout& layout = plan.mosaic.layout;
-            if (!cvc::png_writable(plan.mosaic))
-            {
-                throw std::runtime_error("mosaic of view " + shot.view.name + " (" + size_text(layout.width(), layout.height()) +
-                                         ", tiles " + size_text(layout.tile_width, layout.tile_height) +
-                                         ") exceeds the 2 GiB PNG writer limit, lower --mosaic-resolution");
-            }
-            plans.push_back(plan);
+            plans.push_back(plan_view(shot, count, options));
         }
         return plans;
+    }
+
+    // Depth limits of a view along its direction from its center, or nothing when it has none.
+    std::string depth_text(const cvc::View& view)
+    {
+        if (std::isinf(view.clip_near) && std::isinf(view.clip_far))
+        {
+            return {};
+        }
+        const auto limit = [](double value)
+        {
+            if (std::isinf(value))
+            {
+                return std::string("unlimited");
+            }
+            std::ostringstream out;
+            out << std::fixed << std::setprecision(3) << value << " m";
+            return out.str();
+        };
+        return "depth " + limit(view.clip_near) + " to " + limit(view.clip_far);
     }
 
     void print_views(const std::vector<ViewPlan>& plans)
@@ -282,7 +331,18 @@ namespace
             std::cout << "  " << std::left << std::setw(9) << plan.shot.view.name << std::right << " "
                       << describe(plan.shot.camera) << ", mosaic " << size_text(layout.width(), layout.height()) << " ("
                       << layout.columns << " x " << layout.rows << " tiles of "
-                      << size_text(layout.tile_width, layout.tile_height) << ")\n";
+                      << size_text(layout.tile_width, layout.tile_height) << ")";
+            const std::string depth = depth_text(plan.shot.view);
+            if (!depth.empty())
+            {
+                std::cout << ", " << depth;
+            }
+            std::cout << "\n";
+            const std::string warning = mosaic_warning(plan);
+            if (!warning.empty())
+            {
+                std::cout << "  warning: " << warning << "\n";
+            }
         }
     }
 
@@ -369,7 +429,89 @@ namespace
         }
     }
 
-    void run(const Options& options)
+    // Opens the view editor on the plans. Returns the indices of the views the user changed, which get new plans
+    // while the others keep theirs exactly, or nothing when the run is aborted in the editor.
+    std::optional<std::vector<std::size_t>> edit_plans(const LoadedCloud& reference, std::size_t count,
+                                                       const Options& options, std::vector<ViewPlan>& plans)
+    {
+#ifdef CVC_WITH_GUI
+        std::vector<cvc::Shot> shots;
+        for (const ViewPlan& plan : plans)
+        {
+            shots.push_back(plan.shot);
+        }
+
+        cvc::gui::EditorScene scene;
+        scene.reference  = &reference.cloud;
+        scene.bounds     = reference.bounds;
+        scene.resolution = options.resolution;
+        scene.fit        = [&](const cvc::View& view)
+        { return cvc::fit_view(reference.cloud, view, options.resolution, fit_margin, options.fit_fraction); };
+        scene.check = [&](const cvc::Shot& shot)
+        {
+            cvc::gui::ShotStatus status;
+            try
+            {
+                const ViewPlan           plan   = plan_view(shot, count, options);
+                const cvc::MosaicLayout& layout = plan.mosaic.layout;
+                status.summary                  = "render " + describe(shot.camera) + "\nmosaic " + size_text(layout.width(), layout.height()) +
+                                 ", " + std::to_string(layout.columns) + " x " + std::to_string(layout.rows) +
+                                 " tiles of " + size_text(layout.tile_width, layout.tile_height);
+                status.warning = mosaic_warning(plan);
+            }
+            catch (const std::exception& e)
+            {
+                status.error = e.what();
+            }
+            return status;
+        };
+
+        std::cout << "View editor open, close its window to render with the views it shows\n";
+        if (!cvc::gui::edit_views(scene, shots))
+        {
+            return std::nullopt;
+        }
+
+        std::vector<std::size_t> changed;
+        for (std::size_t i = 0; i < plans.size(); ++i)
+        {
+            if (Json(shots[i]) != Json(plans[i].shot))
+            {
+                plans[i] = plan_view(shots[i], count, options);
+                changed.push_back(i);
+            }
+        }
+        return changed;
+#else
+        (void)reference;
+        (void)count;
+        (void)options;
+        (void)plans;
+        throw std::logic_error("this build has no view editor");
+#endif
+    }
+
+    // Drops the outputs of the given views from the outputs recorded as written, so they are rendered again.
+    std::size_t forget_outputs(std::vector<std::string>& completed, const std::filesystem::path& output_dir,
+                               const std::vector<std::filesystem::path>& outputs)
+    {
+        const auto normal = [](const std::filesystem::path& path)
+        { return std::filesystem::absolute(path).lexically_normal(); };
+
+        std::set<std::filesystem::path> stale;
+        for (const std::filesystem::path& output : outputs)
+        {
+            stale.insert(normal(output));
+        }
+        const std::size_t before = completed.size();
+        completed.erase(std::remove_if(completed.begin(), completed.end(), [&](const std::string& entry)
+                                       { return stale.count(normal(output_dir / std::filesystem::u8path(entry))) > 0; }),
+                        completed.end());
+        return before - completed.size();
+    }
+
+    // Returns false when the run is aborted in the view editor.
+    bool run(const Options& options)
     {
         const Stopwatch total;
 
@@ -424,6 +566,49 @@ namespace
         }
         print_views(plans);
 
+        // Edited views are recorded in the settings file like fitted ones, so a resumed run renders them again
+        // without the editor.
+        if (options.gui_config)
+        {
+            if (!reference)
+            {
+                reference = load(0);
+            }
+            const std::optional<std::vector<std::size_t>> changed = edit_plans(*reference, paths.size(), options, plans);
+            if (!changed)
+            {
+                std::cout << "Run aborted in the view editor, nothing rendered\n";
+                return false;
+            }
+            if (changed->empty())
+            {
+                std::cout << "No views edited\n";
+            }
+            else
+            {
+                std::vector<ViewPlan>              edited;
+                std::vector<std::filesystem::path> outputs;
+                for (const std::size_t k : *changed)
+                {
+                    const ViewPlan& plan = plans[k];
+                    edited.push_back(plan);
+                    for (const std::string& label : labels)
+                    {
+                        outputs.push_back(png_path(full_dir, label + "_" + plan.shot.view.name));
+                        outputs.push_back(png_path(tile_dir, label + "_" + plan.shot.view.name));
+                    }
+                    outputs.push_back(png_path(mosaic_dir, plan.shot.view.name));
+                }
+                std::cout << "Edited views:\n";
+                print_views(edited);
+                if (resume)
+                {
+                    const std::size_t forgotten = forget_outputs(resume->completed, options.output_dir, outputs);
+                    std::cout << forgotten << " written outputs of the edited views will be rendered again\n";
+                }
+            }
+        }
+
         // Written before any output, so the outputs left by a run with other settings are never taken as done.
         Json document     = run_settings;
         document["views"] = plans;
@@ -468,6 +653,8 @@ namespace
             {
                 std::cout << "[" << i + 1 << "/" << paths.size() << "] " << labels[i] << ": all " << written
                           << " renders and mosaic tiles already written, skipped\n";
+                // The reference may have been loaded for the view editor; release it before the next cloud loads.
+                reference.reset();
                 continue;
             }
 
@@ -541,6 +728,7 @@ namespace
         std::cout << "Saved " << mosaics << " mosaics to " << mosaic_dir.string() << " (waited "
                   << mosaic_save_watch.seconds() << " s for encoding)\n";
         std::cout << "Done in " << total.seconds() << " s\n";
+        return true;
     }
 
 }
@@ -576,7 +764,15 @@ int main(int argc, char** argv)
                                 ->transform(CLI::CheckedTransformer(colormap_names(), CLI::ignore_case))
                                 ->default_str("viridis");
     app.add_flag("--resume", options.resume, "Continue an interrupted run: when settings.json in the output directory records the same inputs and options, keep the outputs it lists as written and render only the missing ones");
+    app.add_flag("--gui-config", options.gui_config, "Open a window to adjust the views after they are fitted to the reference: position, orientation, width, height and near and far depth limits, e.g. to render a small section of a large cloud in detail. Closing the window renders with the views it shows, each --resolution pixels along its longer side. Edited views are recorded in settings.json, so --resume continues without the window; with --resume the window starts from the recorded views and the outputs of views changed in it are rendered again");
     CLI11_PARSE(app, argc, argv);
+
+#ifndef CVC_WITH_GUI
+    if (options.gui_config)
+    {
+        return app.exit(CLI::ValidationError("--gui-config", "this build has no view editor, configure CMake with -DCVC_BUILD_GUI=ON"));
+    }
+#endif
 
     if (colormap->count() > 0 && !uses_colormap(options.format))
     {
@@ -585,12 +781,12 @@ int main(int argc, char** argv)
 
     try
     {
-        run(options);
+        // A run aborted in the view editor exits with 2, so scripts do not take it for a finished one.
+        return run(options) ? 0 : 2;
     }
     catch (const std::exception& e)
     {
         std::cerr << "error: " << e.what() << "\n";
         return 1;
     }
-    return 0;
 }

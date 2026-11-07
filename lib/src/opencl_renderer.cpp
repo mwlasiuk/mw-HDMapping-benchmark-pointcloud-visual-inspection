@@ -3,7 +3,10 @@
 #include <CL/cl.h>
 #include <glm/vec3.hpp>
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -22,7 +25,7 @@ uint encode_depth(float depth)
     return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
-bool project(float4 point, float4 target, float4 right, float4 up, float4 forward, float2 scale,
+bool project(float4 point, float4 target, float4 right, float4 up, float4 forward, float2 scale, float2 clip,
              int width, int height, int radius, int* px, int* py, uint* key)
 {
     float3 d = point.xyz - target.xyz;
@@ -31,14 +34,18 @@ bool project(float4 point, float4 target, float4 right, float4 up, float4 forwar
     if (!(u >= -(float)radius && u < (float)(width + radius) && v >= -(float)radius && v < (float)(height + radius))) {
         return false;
     }
+    float z = dot(d, forward.xyz);
+    if (z < clip.x || z > clip.y) {
+        return false;
+    }
     *px = (int)floor(u);
     *py = (int)floor(v);
-    *key = encode_depth(dot(d, forward.xyz));
+    *key = encode_depth(z);
     return true;
 }
 
 __kernel void splat_depth(__global const float4* points, uint count,
-                          float4 target, float4 right, float4 up, float4 forward, float2 scale,
+                          float4 target, float4 right, float4 up, float4 forward, float2 scale, float2 clip,
                           int width, int height, int radius,
                           __global uint* depth)
 {
@@ -48,7 +55,7 @@ __kernel void splat_depth(__global const float4* points, uint count,
     }
     int px, py;
     uint key;
-    if (!project(points[i], target, right, up, forward, scale, width, height, radius, &px, &py, &key)) {
+    if (!project(points[i], target, right, up, forward, scale, clip, width, height, radius, &px, &py, &key)) {
         return;
     }
     int x0 = max(px - radius, 0);
@@ -66,7 +73,7 @@ __kernel void splat_depth(__global const float4* points, uint count,
 }
 
 __kernel void splat_index(__global const float4* points, uint count,
-                          float4 target, float4 right, float4 up, float4 forward, float2 scale,
+                          float4 target, float4 right, float4 up, float4 forward, float2 scale, float2 clip,
                           int width, int height, int radius,
                           __global const uint* depth, __global uint* index)
 {
@@ -76,7 +83,7 @@ __kernel void splat_index(__global const float4* points, uint count,
     }
     int px, py;
     uint key;
-    if (!project(points[i], target, right, up, forward, scale, width, height, radius, &px, &py, &key)) {
+    if (!project(points[i], target, right, up, forward, scale, clip, width, height, radius, &px, &py, &key)) {
         return;
     }
     int x0 = max(px - radius, 0);
@@ -397,6 +404,13 @@ __kernel void resolve(__global const uint* index, __global const float4* points,
             return result;
         }
 
+        // Keeps infinite bounds infinite and clamps finite ones into float range, where the cast would be undefined.
+        cl_float to_clip_float(double value)
+        {
+            constexpr double limit = std::numeric_limits<cl_float>::max();
+            return std::isinf(value) ? static_cast<cl_float>(value) : static_cast<cl_float>(std::clamp(value, -limit, limit));
+        }
+
     }
 
     struct OpenCLRenderer::Impl
@@ -517,6 +531,10 @@ __kernel void resolve(__global const uint* index, __global const float4* points,
         {
             throw std::invalid_argument("invalid orthographic camera");
         }
+        if (!(view.clip_near < view.clip_far))
+        {
+            throw std::invalid_argument("view " + view.name + " has an empty depth range");
+        }
 
         const std::size_t pixel_count = static_cast<std::size_t>(camera.width) * static_cast<std::size_t>(camera.height);
         if (pixel_count >= invalid_index)
@@ -543,16 +561,19 @@ __kernel void resolve(__global const uint* index, __global const float4* points,
         const cl_float4 up      = to_float4(view.up);
         const cl_float4 forward = to_float4(view.forward);
         cl_float2       scale{};
-        scale.s[0]          = static_cast<cl_float>(camera.width / (2.0 * camera.half_width));
-        scale.s[1]          = static_cast<cl_float>(camera.height / (2.0 * camera.half_height));
+        scale.s[0] = static_cast<cl_float>(camera.width / (2.0 * camera.half_width));
+        scale.s[1] = static_cast<cl_float>(camera.height / (2.0 * camera.half_height));
+        cl_float2 clip{};
+        clip.s[0]           = to_clip_float(view.clip_near);
+        clip.s[1]           = to_clip_float(view.clip_far);
         const cl_int width  = camera.width;
         const cl_int height = camera.height;
         const cl_int radius = settings.point_radius;
 
-        set_args(s.splat_depth.get(), points, count, target, right, up, forward, scale, width, height, radius, depth);
+        set_args(s.splat_depth.get(), points, count, target, right, up, forward, scale, clip, width, height, radius, depth);
         enqueue(queue, s.splat_depth.get(), count);
 
-        set_args(s.splat_index.get(), points, count, target, right, up, forward, scale, width, height, radius, depth, index);
+        set_args(s.splat_index.get(), points, count, target, right, up, forward, scale, clip, width, height, radius, depth, index);
         enqueue(queue, s.splat_index.get(), count);
 
         const float    range           = settings.intensity.max - settings.intensity.min;

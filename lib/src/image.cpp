@@ -91,6 +91,16 @@ namespace cvc
         return data + 32766 <= limit && stored + 64 <= limit;
     }
 
+    bool png_readable(int width, int height, int channels)
+    {
+        if (width <= 0 || height <= 0 || channels <= 0)
+        {
+            return false;
+        }
+        // The same test stb_image applies to the PNG header.
+        return (1 << 30) / width / channels >= height;
+    }
+
     void save_png(const Image& image, const std::filesystem::path& path)
     {
         const std::size_t expected = static_cast<std::size_t>(image.width) * image.height * image.channels;

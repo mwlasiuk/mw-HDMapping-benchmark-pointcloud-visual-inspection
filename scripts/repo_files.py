@@ -15,6 +15,7 @@ REQUIREMENTS_FILE = os.path.join(PROJECT_DIR, "requirements.txt")
 
 FILE_LOCATIONS = [
     os.path.join(PROJECT_DIR, "cmd"),
+    os.path.join(PROJECT_DIR, "gui"),
     os.path.join(PROJECT_DIR, "lib"),
 ]
 

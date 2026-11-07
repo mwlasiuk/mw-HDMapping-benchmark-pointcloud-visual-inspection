@@ -17,6 +17,9 @@ namespace cvc
 
     bool png_writable(int width, int height, int channels);
 
+    // Whether load_png can read such a PNG back; the reader refuses images over 1 GiB of raw pixels.
+    bool png_readable(int width, int height, int channels);
+
     void save_png(const Image& image, const std::filesystem::path& path);
 
     Image load_png(const std::filesystem::path& path, int channels);

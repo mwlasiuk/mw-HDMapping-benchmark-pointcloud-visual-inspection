@@ -75,6 +75,42 @@ namespace cvc
             TrimmedMinimum high_v;
         };
 
+        void check_fit_arguments(const PointCloud& cloud, int resolution, double contained_fraction)
+        {
+            if (resolution <= 0)
+            {
+                throw std::invalid_argument("camera resolution must be positive");
+            }
+            if (!(contained_fraction > 0.0 && contained_fraction <= 1.0))
+            {
+                throw std::invalid_argument("contained fraction must be in (0, 1]");
+            }
+            if (cloud.points.empty())
+            {
+                throw std::invalid_argument("cannot fit views to an empty point cloud");
+            }
+        }
+
+        std::size_t discard_count(std::size_t points, double contained_fraction)
+        {
+            return static_cast<std::size_t>(std::floor(static_cast<double>(points) * (1.0 - contained_fraction) / 4.0));
+        }
+
+        // Centers the view on the extent of the cloud projected onto its image plane, with margin around it.
+        Shot make_shot(const PointCloud& cloud, const View& view, const ProjectedExtent& extent, int resolution, double margin)
+        {
+            const glm::dvec3 offset = cloud.origin - view.target;
+            const glm::dvec2 shift(glm::dot(offset, view.right), glm::dot(offset, view.up));
+            const glm::dvec2 low    = extent.low() + shift;
+            const glm::dvec2 high   = extent.high() + shift;
+            const glm::dvec2 center = 0.5 * (low + high);
+            const glm::dvec2 half   = glm::max(0.5 * (high - low) * margin, glm::dvec2(1e-6));
+
+            Shot shot{view, make_camera(half.x, half.y, resolution)};
+            shot.view.target = view.target + view.right * center.x + view.up * center.y;
+            return shot;
+        }
+
     }
 
     OrthographicCamera make_camera(double half_width, double half_height, int resolution)
@@ -154,21 +190,8 @@ namespace cvc
     std::vector<Shot> fit_views(const PointCloud& cloud, const std::vector<View>& views, int resolution, double margin,
                                 double contained_fraction)
     {
-        if (resolution <= 0)
-        {
-            throw std::invalid_argument("camera resolution must be positive");
-        }
-        if (!(contained_fraction > 0.0 && contained_fraction <= 1.0))
-        {
-            throw std::invalid_argument("contained fraction must be in (0, 1]");
-        }
-        if (cloud.points.empty())
-        {
-            throw std::invalid_argument("cannot fit views to an empty point cloud");
-        }
-
-        const auto discard = static_cast<std::size_t>(
-            std::floor(static_cast<double>(cloud.points.size()) * (1.0 - contained_fraction) / 4.0));
+        check_fit_arguments(cloud, resolution, contained_fraction);
+        const std::size_t discard = discard_count(cloud.points.size(), contained_fraction);
 
         const std::size_t      count = views.size();
         std::vector<glm::vec3> rights(count);
@@ -192,19 +215,41 @@ namespace cvc
         shots.reserve(count);
         for (std::size_t k = 0; k < count; ++k)
         {
-            const View&      view   = views[k];
-            const glm::dvec3 offset = cloud.origin - view.target;
-            const glm::dvec2 shift(glm::dot(offset, view.right), glm::dot(offset, view.up));
-            const glm::dvec2 low    = extents[k].low() + shift;
-            const glm::dvec2 high   = extents[k].high() + shift;
-            const glm::dvec2 center = 0.5 * (low + high);
-            const glm::dvec2 half   = glm::max(0.5 * (high - low) * margin, glm::dvec2(1e-6));
-
-            Shot shot{view, make_camera(half.x, half.y, resolution)};
-            shot.view.target = view.target + view.right * center.x + view.up * center.y;
-            shots.push_back(shot);
+            shots.push_back(make_shot(cloud, views[k], extents[k], resolution, margin));
         }
         return shots;
+    }
+
+    Shot fit_view(const PointCloud& cloud, const View& view, int resolution, double margin, double contained_fraction)
+    {
+        check_fit_arguments(cloud, resolution, contained_fraction);
+
+        // Depth of a point relative to the target, computed in the frame of the cloud origin like the renderer does.
+        const glm::vec3 forward(view.forward);
+        const glm::vec3 right(view.right);
+        const glm::vec3 up(view.up);
+        const auto      offset = static_cast<float>(glm::dot(view.target - cloud.origin, view.forward));
+        const auto      inside = [&](const Point& p)
+        {
+            const float z = glm::dot(p.position, forward) - offset;
+            return !(z < view.clip_near || z > view.clip_far);
+        };
+
+        const auto contained = static_cast<std::size_t>(std::count_if(cloud.points.begin(), cloud.points.end(), inside));
+        if (contained == 0)
+        {
+            throw std::runtime_error("no points of the cloud lie within the depth range of view " + view.name);
+        }
+
+        ProjectedExtent extent(discard_count(contained, contained_fraction));
+        for (const Point& p : cloud.points)
+        {
+            if (inside(p))
+            {
+                extent.add(glm::vec2(glm::dot(p.position, right), glm::dot(p.position, up)));
+            }
+        }
+        return make_shot(cloud, view, extent, resolution, margin);
     }
 
 }
