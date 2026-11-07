@@ -22,3 +22,9 @@
 [submodule "external/zlib-ng"]
 	path = external/zlib-ng
 	url = https://github.com/zlib-ng/zlib-ng.git
+[submodule "external/json"]
+	path = external/json
+	url = https://github.com/nlohmann/json.git
+[submodule "external/imgui"]
+	path = external/imgui
+	url = https://github.com/ocornut/imgui.git

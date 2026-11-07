@@ -38,6 +38,9 @@ target_include_directories(glm SYSTEM INTERFACE ${EXTERNAL_DIR}/glm)
 add_library(cli11 INTERFACE)
 target_include_directories(cli11 SYSTEM INTERFACE ${EXTERNAL_DIR}/CLI11/include)
 
+add_library(nlohmann_json INTERFACE)
+target_include_directories(nlohmann_json SYSTEM INTERFACE ${EXTERNAL_DIR}/json/include)
+
 if(MSVC)
     add_compile_options(/W4 /permissive- /utf-8 /MP)
 else()
